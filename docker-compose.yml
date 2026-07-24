@@ -1,0 +1,36 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on first init of an empty data volume:
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional: run the API in a container too. For Week 1 you can instead run
+  # just the db (`make db-up`) and run the API on your host (`make api`).
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      # Override host: from inside compose, Postgres is reachable at "db"
+      DATABASE_URL: postgresql://rag:rag@db:5432/rag
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["full"]   # only starts with: docker compose --profile full up
+
+volumes:
+  pgdata:
