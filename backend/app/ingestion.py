@@ -4,10 +4,19 @@ Stage 1 of the three pipelines. Extraction and chunking are implemented;
 embedding + storage have clear TODOs where your DB and API keys plug in.
 """
 from dataclasses import dataclass
+from functools import lru_cache
+import voyageai
+from app.config import get_settings
 
 import fitz  # pymupdf
 
-from app.config import get_settings
+
+# Voyage caps texts-per-request.
+_EMBED_BATCH_SIZE = 128
+
+@lru_cache
+def _voyage_client() -> voyageai.Client:
+    return voyageai.Client(api_key=get_settings().voyage_api_key)
 
 
 @dataclass
@@ -66,15 +75,38 @@ def chunk_pages(
     return chunks
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of chunk texts. TODO: call Voyage (or OpenAI) in batches.
-
-    import voyageai
-    client = voyageai.Client(api_key=get_settings().voyage_api_key)
-    result = client.embed(texts, model=get_settings().embedding_model, input_type="document")
-    return result.embeddings
+def embed_texts(
+    texts: list[str],
+    input_type: str = "document", # use "query" when embedding a user question
+) -> list[list[float]]:
     """
-    raise NotImplementedError("Wire up the embeddings provider (see docstring).")
+        Embed a batch of chunk texts. 
+
+        Returns: One vector per input text, in the same order
+        Each vector's length == settings.embedding_dim
+    """
+    if not texts:
+        return []
+
+    settings = get_settings()
+    client = _voyage_client()
+
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), _EMBED_BATCH_SIZE):
+        batch = texts[start : start + _EMBED_BATCH_SIZE]
+        # TODO(issue #3): wrap this call in retry/backoff for rate limits.
+        result = client.embed(batch, model=settings.embedding_model, input_type=input_type)
+        vectors.extend(result.embeddings)
+
+        # Sanity Check: catches a model/dimension mismatch immediately instead
+        # of letting it fail deep inside a Postgres INSERT. Must equal vector(...) in
+        # db/init.sql
+        if len(vectors[0]) != settings.embedding_dim:
+            raise ValueError(
+                f"Got embedding dim {len(vectors[0])}, but EMBEDDING_DIM is "
+                f"{settings.embedding_dim}. Update EMBEDDING_DIM and db/init.sql to match."
+            )
+        return vectors
 
 
 def ingest_pdf(pdf_path: str, filename: str) -> str:
