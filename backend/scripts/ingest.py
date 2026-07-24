@@ -5,6 +5,7 @@
 Thin wrapper over app.ingestion so you can test Stage 1 from the terminal
 before any HTTP or frontend exists (build-order step 1).
 """
+
 import sys
 from pathlib import Path
 

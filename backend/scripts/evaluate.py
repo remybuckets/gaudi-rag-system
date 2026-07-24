@@ -6,6 +6,7 @@ This produces the table that proves 'hybrid beats vector-only' — an acceptance
 criterion, and the single most convincing thing in your README. Fill TEST_SET
 with (question, expected_substring) pairs once your corpus is loaded.
 """
+
 from app.retrieval import hybrid_search, vector_search
 
 # (question, a substring you KNOW appears in the correct passage)

@@ -4,6 +4,7 @@ Stage 2. Vector and keyword search hit the DB (stubbed with the exact SQL you
 need in comments). Reciprocal Rank Fusion is implemented in full — that is the
 'hybrid beats vector-only' win, and it's pure logic you can unit-test today.
 """
+
 from dataclasses import dataclass
 
 from app.config import get_settings

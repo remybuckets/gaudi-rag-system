@@ -3,6 +3,7 @@
 Heavy imports (pymupdf, anthropic, voyage) are done lazily inside endpoints so
 the app boots and /health works without every dependency installed.
 """
+
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel

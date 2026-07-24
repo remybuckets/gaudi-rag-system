@@ -1,5 +1,6 @@
 """Lazy Postgres connection pool. Pool is created on first use so the app
 (and the health check / tests) can import without a live database."""
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 

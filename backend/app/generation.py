@@ -4,6 +4,7 @@ Stage 3. Prompt assembly is here; the streaming Claude call has a TODO with the
 shape you need. Check the current Anthropic docs for the exact streaming +
 Citations request format before implementing.
 """
+
 from collections.abc import Iterator
 
 from app.config import get_settings

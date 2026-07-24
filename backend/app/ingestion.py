@@ -3,16 +3,18 @@
 Stage 1 of the three pipelines. Extraction and chunking are implemented;
 embedding + storage have clear TODOs where your DB and API keys plug in.
 """
+
 from dataclasses import dataclass
 from functools import lru_cache
-import voyageai
-from app.config import get_settings
 
 import fitz  # pymupdf
+import voyageai
 
+from app.config import get_settings
 
 # Voyage caps texts-per-request.
 _EMBED_BATCH_SIZE = 128
+
 
 @lru_cache
 def _voyage_client() -> voyageai.Client:
@@ -41,8 +43,8 @@ def extract_pages(pdf_path: str) -> list[tuple[int, str]]:
 
 def chunk_pages(
     pages: list[tuple[int, str]],
-    target_words: int = 220,     # ~500-800 tokens
-    overlap_words: int = 30,     # ~10-15% overlap
+    target_words: int = 220,  # ~500-800 tokens
+    overlap_words: int = 30,  # ~10-15% overlap
 ) -> list[Chunk]:
     """Simple word-window chunker with overlap, preserving page numbers.
 
@@ -77,13 +79,13 @@ def chunk_pages(
 
 def embed_texts(
     texts: list[str],
-    input_type: str = "document", # use "query" when embedding a user question
+    input_type: str = "document",  # use "query" when embedding a user question
 ) -> list[list[float]]:
     """
-        Embed a batch of chunk texts. 
+    Embed a batch of chunk texts.
 
-        Returns: One vector per input text, in the same order
-        Each vector's length == settings.embedding_dim
+    Returns: One vector per input text, in the same order
+    Each vector's length == settings.embedding_dim
     """
     if not texts:
         return []
@@ -122,6 +124,5 @@ def ingest_pdf(pdf_path: str, filename: str) -> str:
     # TODO: embeddings = embed_texts([c.content for c in chunks])
     # TODO: write documents + chunks rows, return document_id
     raise NotImplementedError(
-        f"Extracted {len(pages)} pages -> {len(chunks)} chunks. "
-        "Now wire embedding + DB insert."
+        f"Extracted {len(pages)} pages -> {len(chunks)} chunks. Now wire embedding + DB insert."
     )
