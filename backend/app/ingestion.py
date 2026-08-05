@@ -4,6 +4,7 @@ Stage 1 of the three pipelines. Extraction and chunking are implemented;
 embedding + storage have clear TODOs where your DB and API keys plug in.
 """
 
+import hashlib
 import logging
 import random
 import time
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Voyage caps texts-per-request.
 _EMBED_BATCH_SIZE = 128
 _MAX_EMBED_RETRIES = 5
-_BASE_RETRY_DELAY = 5  # CHANGE SOMETHINGS
+_BASE_RETRY_DELAY = 1
 
 
 _RETRYABLE_ERROR_NAMES = frozenset(
@@ -84,6 +85,7 @@ class IngestResult:
     document_id: str
     page_count: int
     chunk_count: int
+    skipped: bool = False
 
 
 def extract_pages(pdf_path: str) -> list[tuple[int, str]]:
@@ -150,7 +152,7 @@ def embed_texts(
     client = _voyage_client()
 
     vectors: list[list[float]] = []
-    total = len(texts) + _EMBED_BATCH_SIZE - 1
+    total = (len(texts) + _EMBED_BATCH_SIZE - 1) // _EMBED_BATCH_SIZE
     for n, start in enumerate(range(0, len(texts), _EMBED_BATCH_SIZE), start=1):
         batch = texts[start : start + _EMBED_BATCH_SIZE]
         logger.info("Embedding batch %d/%d (%d texts)", n, total, len(batch))
@@ -169,30 +171,36 @@ def embed_texts(
 
     return vectors
 
-    for start in range(0, len(texts), _EMBED_BATCH_SIZE):
-        batch = texts[start : start + _EMBED_BATCH_SIZE]
-        # TODO(issue #3): wrap this call in retry/backoff for rate limits.
-        result = client.embed(batch, model=settings.embedding_model, input_type=input_type)
-        vectors.extend(result.embeddings)
 
-        # Sanity Check: catches a model/dimension mismatch immediately instead
-        # of letting it fail deep inside a Postgres INSERT. Must equal vector(...) in
-        # db/init.sql
-        if len(vectors[0]) != settings.embedding_dim:
-            raise ValueError(
-                f"Got embedding dim {len(vectors[0])}, but EMBEDDING_DIM is "
-                f"{settings.embedding_dim}. Update EMBEDDING_DIM and db/init.sql to match."
-            )
-        return vectors
+def _file_hash(path: str) -> str:
+    """Identity of the file's *contents*, so an edited PDF under the same
+    filename is detected as changed rather than skipped."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(1024 * 1024):
+            h.update(block)
+    return h.hexdigest()
 
 
-def ingest_pdf(pdf_path: str, filename: str) -> IngestResult:
+def ingest_pdf(pdf_path: str, filename: str, force: bool = False) -> IngestResult:
     """Full pipeline for one PDF. Returns the new document id.
 
     Steps: extract -> chunk -> embed (batched) -> INSERT document + chunks.
     TODO: insert into `documents`, batch-embed, then INSERT chunks with
     embedding/page_number/section via app.db.get_conn().
     """
+    content_hash = _file_hash(pdf_path)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, page_count, metadata->>'content_hash' FROM documents WHERE filename = %s",
+            (filename,),
+        )
+        row = cur.fetchone()
+        if not force and row is not None and row[2] == content_hash:
+            cur.execute("SELECT count(*) FROM chunks WHERE document_id = %s", (row[0],))
+            logger.info("Skipping %s: unchanged (document_id=%s)", filename, row[0])
+            return IngestResult(str(row[0]), row[1], cur.fetchone()[0], skipped=True)
     pages = extract_pages(pdf_path)
     chunks = chunk_pages(pages)
     if not chunks:
@@ -205,13 +213,19 @@ def ingest_pdf(pdf_path: str, filename: str) -> IngestResult:
     title = Path(filename).stem
 
     with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM documents WHERE filename =%s", (filename,))
         cur.execute(
             """
             INSERT INTO documents (filename, title, page_count, metadata)
             VALUES (%s, %s, %s, %s)
             RETURNING id
             """,
-            (filename, title, len(pages), Jsonb({"source_path": str(pdf_path)})),
+            (
+                filename,
+                title,
+                len(pages),
+                Jsonb({"source_path": str(pdf_path), "content_hash": content_hash}),
+            ),
         )
         document_id = cur.fetchone()[0]
 

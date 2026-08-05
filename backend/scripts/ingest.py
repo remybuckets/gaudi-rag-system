@@ -6,6 +6,7 @@ Thin wrapper over app.ingestion so you can test Stage 1 from the terminal
 before any HTTP or frontend exists (build-order step 1).
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from app.ingestion import ingest_pdf
 
 
 def main(argv: list[str]) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    force = "--force" in argv
+    argv = [a for a in argv if a != "--force"]
     if not argv:
         print("usage: python -m scripts.ingest <file.pdf> [file.pdf ...]")
         return 1
@@ -26,12 +30,13 @@ def main(argv: list[str]) -> int:
                 failures += 1
                 continue
             try:
-                result = ingest_pdf(str(p), p.name)
+                result = ingest_pdf(str(p), p.name, force=force)
             except Exception as exc:
                 print(f"FAILED {p.name}: {type(exc).__name__}: {exc}")
                 failures += 1
                 continue
-            print(f"ingested {p.name} -> {result.chunk_count} chunks, id={result.document_id}")
+            verb = "skipped (unchanged)" if result.skipped else "ingested"
+            print(f"{verb} {p.name} -> {result.chunk_count} chunks, id={result.document_id}")
     finally:
         close_pool()
 
