@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: rag
       POSTGRES_DB: rag
     ports:
-      - "5432:5432"
+      - "5440:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Runs once, on first init of an empty data volume:
@@ -24,7 +24,7 @@ services:
     env_file: .env
     environment:
       # Override host: from inside compose, Postgres is reachable at "db"
-      DATABASE_URL: postgresql://rag:rag@db:5432/rag
+      DATABASE_URL: postgresql://rag:rag@db:5440/rag
     ports:
       - "8000:8000"
     depends_on:

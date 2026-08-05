@@ -4,16 +4,63 @@ Stage 1 of the three pipelines. Extraction and chunking are implemented;
 embedding + storage have clear TODOs where your DB and API keys plug in.
 """
 
+import logging
+import random
+import time
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 import fitz  # pymupdf
+import numpy as np
 import voyageai
+from psycopg.types.json import Jsonb
 
 from app.config import get_settings
+from app.db import get_conn
+
+logger = logging.getLogger(__name__)
 
 # Voyage caps texts-per-request.
 _EMBED_BATCH_SIZE = 128
+_MAX_EMBED_RETRIES = 5
+_BASE_RETRY_DELAY = 5  # CHANGE SOMETHINGS
+
+
+_RETRYABLE_ERROR_NAMES = frozenset(
+    {
+        "RateLimitError",
+        "ServiceUnavailableError",
+        "Timeout",
+        "APIConnectionError",
+        "APIError",
+        "ConnectionError",
+    }
+)
+
+
+def _embed_batch_with_retry(client, batch: list[str], model: str, input_type: str):
+    """One Voyage call with exponential backoff + jitter on transient errors."""
+    delay = _BASE_RETRY_DELAY
+    for attempt in range(1, _MAX_EMBED_RETRIES + 1):
+        try:
+            return client.embed(batch, model=model, input_type=input_type)
+        except Exception as exc:
+            name = type(exc).__name__
+            if name not in _RETRYABLE_ERROR_NAMES or attempt == _MAX_EMBED_RETRIES:
+                raise
+            sleep_for = delay + random.uniform(0, delay * 0.5)
+            logger.warning(
+                "Voyage %s (attempt %d/%d); retrying in %.1fs",
+                name,
+                attempt,
+                _MAX_EMBED_RETRIES,
+                sleep_for,
+            )
+            time.sleep(sleep_for)
+            delay *= 2
+
+    raise RuntimeError("Unreachable")
 
 
 @lru_cache
@@ -28,6 +75,15 @@ class Chunk:
     chunk_index: int
     section: str | None = None
     token_count: int | None = None
+
+
+@dataclass
+class IngestResult:
+    """What /upload returns and what scripts/ingest.oy prints."""
+
+    document_id: str
+    page_count: int
+    chunk_count: int
 
 
 def extract_pages(pdf_path: str) -> list[tuple[int, str]]:
@@ -94,6 +150,25 @@ def embed_texts(
     client = _voyage_client()
 
     vectors: list[list[float]] = []
+    total = len(texts) + _EMBED_BATCH_SIZE - 1
+    for n, start in enumerate(range(0, len(texts), _EMBED_BATCH_SIZE), start=1):
+        batch = texts[start : start + _EMBED_BATCH_SIZE]
+        logger.info("Embedding batch %d/%d (%d texts)", n, total, len(batch))
+        result = _embed_batch_with_retry(client, batch, settings.embedding_model, input_type)
+        vectors.extend(result.embeddings)
+
+    if len(vectors[0]) != settings.embedding_dim:
+        raise ValueError(
+            f"Got embedding dim {len(vectors[0])}, but EMBEDDING_DIM is "
+            f"{settings.embedding_dim}. Update EMBEDDING_DIM and db/init.sql to match."
+        )
+    if len(vectors) != len(texts):
+        raise RuntimeError(
+            f"Embedded {len(vectors)} vectors for {len(texts)} texts - batching lost data."
+        )
+
+    return vectors
+
     for start in range(0, len(texts), _EMBED_BATCH_SIZE):
         batch = texts[start : start + _EMBED_BATCH_SIZE]
         # TODO(issue #3): wrap this call in retry/backoff for rate limits.
@@ -111,7 +186,7 @@ def embed_texts(
         return vectors
 
 
-def ingest_pdf(pdf_path: str, filename: str) -> str:
+def ingest_pdf(pdf_path: str, filename: str) -> IngestResult:
     """Full pipeline for one PDF. Returns the new document id.
 
     Steps: extract -> chunk -> embed (batched) -> INSERT document + chunks.
@@ -120,9 +195,52 @@ def ingest_pdf(pdf_path: str, filename: str) -> str:
     """
     pages = extract_pages(pdf_path)
     chunks = chunk_pages(pages)
-    _ = get_settings()  # config available here
-    # TODO: embeddings = embed_texts([c.content for c in chunks])
-    # TODO: write documents + chunks rows, return document_id
-    raise NotImplementedError(
-        f"Extracted {len(pages)} pages -> {len(chunks)} chunks. Now wire embedding + DB insert."
+    if not chunks:
+        raise ValueError(
+            f"{filename}: no extractable text found - scanned/image-only PDF? "
+            "Needs OCR before ingestion."
+        )
+
+    embeddings = embed_texts([c.content for c in chunks])
+    title = Path(filename).stem
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO documents (filename, title, page_count, metadata)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (filename, title, len(pages), Jsonb({"source_path": str(pdf_path)})),
+        )
+        document_id = cur.fetchone()[0]
+
+        cur.executemany(
+            """
+            INSERT INTO chunks (
+                document_id, content, embedding,
+                page_number, section, chunk_index, token_count
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (
+                    document_id,
+                    c.content,
+                    np.asarray(v, dtype=np.float32),
+                    c.page_number,
+                    c.section,
+                    c.chunk_index,
+                    c.token_count,
+                )
+                for c, v in zip(chunks, embeddings, strict=True)
+            ],
+        )
+    logger.info(
+        "Ingested %s: %d ages -> %d chunks (document_id=%s)",
+        filename,
+        len(pages),
+        len(chunks),
+        document_id,
     )
+    return IngestResult(str(document_id), len(pages), len(chunks))
