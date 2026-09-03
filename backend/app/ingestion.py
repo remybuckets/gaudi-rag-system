@@ -7,6 +7,7 @@ embedding + storage have clear TODOs where your DB and API keys plug in.
 import hashlib
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -88,6 +89,36 @@ class IngestResult:
     skipped: bool = False
 
 
+@dataclass
+class _Line:
+    text: str
+    page_number: int
+    section: str | None
+
+
+def _labelled_lines(pages: list[tuple[int, str]]) -> list[_Line]:
+    """Flatten pages to cleaned lines, each tagged with the clause it sits under.
+
+    Runs across the whole document, not per page, so a clause continuing onto
+    the next page keeps its label instead of resetting to None.
+    """
+
+    noise = find_repeated_lines(pages)
+    out: list[_Line] = []
+    current: str | None = None
+    for page_number, text in pages:
+        for raw in text.splitlines():
+            if _is_noise_line(raw) or _normalise(raw) in noise:
+                continue
+            if _SECTION_RESET.match(raw):
+                current = None
+            found = detect_section(raw)
+            if found:
+                current = found
+            out.append(_Line(raw.strip(), page_number, current))
+    return out
+
+
 def extract_pages(pdf_path: str) -> list[tuple[int, str]]:
     """Return [(page_number, text), ...]. page_number is 1-based for citations."""
     doc = fitz.open(pdf_path)
@@ -97,6 +128,93 @@ def extract_pages(pdf_path: str) -> list[tuple[int, str]]:
         pages.append((i, text))
     doc.close()
     return pages
+
+
+# Anchored at line start (^) and match, not search: "set out in 6.2 below" must
+# not read as a heading, or prose gets shredded into one-line fragments.
+_HEADING_PATTERNS = (
+    # "Requirement B4", "Requirement B4:" — the strongest signal, so tried first.
+    re.compile(r"^\s*(Requirement\s+[A-T]\d{1,2})\b", re.IGNORECASE),
+    # "B1", "K2" — a bare part letter + number, alone on its line.
+    re.compile(r"^\s*([A-T]\d{1,2})\s*$"),
+    # "6.2", "6.2.1 Ventilation openings" — numbered clause opening a line.
+    re.compile(r"^\s*(\d{1,2}(?:\.\d{1,3}){1,3})\s+\S"),
+    # Appendices end the numbered clauses; without this the last clause number
+    # leaks into every appendix and back-matter page.
+    re.compile(r"^\s*(Appendix\s+[A-Z])\b"),
+    # "Section 1: Ventilation provision" — Part F's real structural boundary.
+    # Without it a cover-page requirement label carries through all front matter.
+    re.compile(r"^\s*(Section\s+\d{1,2})\b"),
+)
+
+# Back matter has no clause numbering, so the last clause seen must be cleared
+# rather than inherited — a citation naming a clause for index text is worse
+# than no clause at all.
+_SECTION_RESET = re.compile(
+    r"^\s*(List of approved documents|Index|Contents|Standards referred to|"
+    r"Other documents referred to)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_section(line: str) -> str | None:
+    """Return the clause label a line introduces, or None if it's body text.
+
+    Approved Documents number every clause, so this label is what turns a
+    citation from "page 47" into "Requirement B4, page 47".
+    """
+    if len(line) > 120:
+        return None
+    for pattern in _HEADING_PATTERNS:
+        m = pattern.match(line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+_ROMAN_OR_PAGE_NO = re.compile(r"^(?:[ivxlcdm]{1,7}|\d{1,3})$", re.IGNORECASE)
+
+
+def _is_noise_line(line: str) -> bool:
+    """Page furniture: watermarks, bare page numbers, empty/tab-only lines."""
+    s = line.strip()
+    if not s:
+        return True
+    if _ROMAN_OR_PAGE_NO.match(s):
+        return True
+    parts = s.split()
+
+    return len(parts) >= 6 and all(len(p) == 1 for p in parts)
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _normalise(line: str) -> str:
+    """Canonical form for comparing lines across pages."""
+    return " ".join(_CONTROL_CHARS.sub(" ", line).split())
+
+
+def find_repeated_lines(
+    pages: list[tuple[int, str]],
+    edge_lines: int = 3,
+    min_page_fraction: float = 0.5,
+) -> set[str]:
+    """Lines recurring at the top/bottom of most pages - running headers.
+
+    Every Document has different ones, so theyre learned per document rather
+    than pattern-matched
+    """
+
+    counts: dict[str, int] = {}
+    for _, text in pages:
+        lines = [_normalise(ln) for ln in text.splitlines() if _normalise(ln)]
+        edges = lines[:edge_lines] + lines[-edge_lines:]
+        for line in set(edges):
+            counts[line] = counts.get(line, 0) + 1
+
+    threshold = max(2, int(len(pages) * min_page_fraction))
+    return {line for line, n in counts.items() if n >= threshold}
 
 
 def chunk_pages(
