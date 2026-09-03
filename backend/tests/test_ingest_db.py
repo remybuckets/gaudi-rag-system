@@ -20,8 +20,12 @@ pytestmark = pytest.mark.skipif(not _db_up(), reason="no live Postgres")
 def _make_pdf(path, pages=3):
     doc = fitz.open()
     for n in range(pages):
-        doc.new_page().insert_text((72, 72), f"Page {n + 1}. " + "ventilation clause " * 80)
-
+        # Clause label per page: the chunker splits on section boundaries, so
+        # without these all pages coalesce into one chunk and the 1-based page
+        # assertion can't fire.
+        doc.new_page().insert_text(
+            (72, 72), f"{n + 1}.1 Ventilation\n" + f"page {n + 1} ventilation clause " * 40
+        )
     doc.save(path)
     doc.close()
 
@@ -47,3 +51,21 @@ def test_ingest_writes_document_and_chunks(tmp_path):
 
     assert n == embedded == result.chunk_count
     assert (lo, hi) == (1, 3)  # 1-based pages; off-by-one here breaks citations
+
+
+def test_ingest_rejects_textless_pdf(tmp_path):
+    """No DB and no API key needed: the ValueError fires before either is
+    touched, so this belongs in CI rather than behind the integration mark."""
+    import fitz
+
+    from app.ingestion import ingest_pdf
+
+    path = tmp_path / "blank.pdf"
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page()
+    doc.save(str(path))
+    doc.close()
+
+    with pytest.raises(ValueError, match="no extractable text"):
+        ingest_pdf(str(path), "blank.pdf")

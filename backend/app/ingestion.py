@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 _EMBED_BATCH_SIZE = 128
 _MAX_EMBED_RETRIES = 5
 _BASE_RETRY_DELAY = 1
-
+_MIN_PAGE_CHARS = 50
+_MIN_CHUNK_CHARS = 50
 
 _RETRYABLE_ERROR_NAMES = frozenset(
     {
@@ -217,39 +218,109 @@ def find_repeated_lines(
     return {line for line, n in counts.items() if n >= threshold}
 
 
+def _split_run(
+    run: list[_Line],
+    target_words: int,
+    overlap_words: int,
+) -> list[list[_Line]]:
+    """Split one clause's lines into windows no larger than target_words.
+
+    Most clauses fit in one window. The ones that don't are the clauses
+    followed by a long Table or Diagram (1.58, 3.9, Appendix A): a single
+    2000-word chunk embeds to the average of everything in it and then
+    retrieves for nothing in particular.
+    """
+    windows: list[list[_Line]] = []
+    current: list[_Line] = []
+    words = 0
+    for line in run:
+        n = len(line.text.split())
+        if current and words + n > target_words:
+            windows.append(current)
+            carry: list[_Line] = []
+            carried = 0
+            for prev in reversed(current):
+                if carried >= overlap_words:
+                    break
+                carry.insert(0, prev)
+                carried += len(prev.text.split())
+            current = carry
+            words = carried
+        current.append(line)
+        words += n
+    if current:
+        windows.append(current)
+    return windows
+
+
+def _emit_run(
+    run: list[_Line],
+    chunks: list[Chunk],
+    idx: int,
+    target_words: int,
+    overlap_words: int,
+) -> int:
+    """Turn one clause's lines into Chunks. Returns the next chunk_index."""
+    for window in _split_run(run, target_words, overlap_words):
+        content = " ".join(ln.text for ln in window)
+        if len(content.strip()) < _MIN_CHUNK_CHARS:
+            continue
+        chunks.append(
+            Chunk(
+                content=content,
+                page_number=window[0].page_number,
+                chunk_index=idx,
+                section=window[0].section,
+                token_count=len(content.split()),
+            )
+        )
+        idx += 1
+    return idx
+
+
+def check_extraction(pages: list[tuple[int, str]], filename: str) -> list[int]:
+    empty = [n for n, text in pages if len(text.strip()) < _MIN_PAGE_CHARS]
+    if empty:
+        logger.warning(
+            "%s: %d/%d pages have no extractable text (pages %s) - scanned or image-only?",
+            filename,
+            len(empty),
+            len(pages),
+            ", ".join(str(n) for n in empty[:20]),
+        )
+    return empty
+
+
 def chunk_pages(
     pages: list[tuple[int, str]],
     target_words: int = 220,  # ~500-800 tokens
     overlap_words: int = 30,  # ~10-15% overlap
 ) -> list[Chunk]:
-    """Simple word-window chunker with overlap, preserving page numbers.
+    """Chunk on clause boundaries, falling back to word windows inside a clause.
 
-    TODO(structure-aware): detect headings / clause numbers (e.g. "6.2",
-    "Requirement B1") and split on those first so a chunk maps to one clause.
-    That is where retrieval quality on Approved Documents really improves.
+    Consumes _labelled_lines rather than raw page text, so noise filtering,
+    header stripping and the cross-page section carry all apply here for free.
+
+    In Approved Documents the clause number sits inline at the start of its
+    paragraph, so a change of label *is* a paragraph boundary — splitting on
+    it gives semantically whole clauses rather than arbitrary word windows.
     """
+    lines = _labelled_lines(pages)
     chunks: list[Chunk] = []
     idx = 0
-    for page_number, text in pages:
-        if not text:
-            continue
-        words = text.split()
-        start = 0
-        while start < len(words):
-            window = words[start : start + target_words]
-            content = " ".join(window)
-            chunks.append(
-                Chunk(
-                    content=content,
-                    page_number=page_number,
-                    chunk_index=idx,
-                    token_count=len(window),  # rough proxy; swap for a real tokenizer
-                )
-            )
-            idx += 1
-            if start + target_words >= len(words):
-                break
-            start += target_words - overlap_words
+
+    run: list[_Line] = []
+    for line in lines:
+        # Label change closes the run. Compared against the run's own first
+        # line, not the previous line, so unlabelled continuation text stays
+        # attached to the clause it belongs to.
+        if run and line.section != run[0].section:
+            idx = _emit_run(run, chunks, idx, target_words, overlap_words)
+            run = []
+        run.append(line)
+    if run:
+        idx = _emit_run(run, chunks, idx, target_words, overlap_words)
+
     return chunks
 
 
@@ -320,11 +391,17 @@ def ingest_pdf(pdf_path: str, filename: str, force: bool = False) -> IngestResul
             logger.info("Skipping %s: unchanged (document_id=%s)", filename, row[0])
             return IngestResult(str(row[0]), row[1], cur.fetchone()[0], skipped=True)
     pages = extract_pages(pdf_path)
+    empty = check_extraction(pages, filename)
     chunks = chunk_pages(pages)
+    if len(empty) > len(pages) / 2:
+        raise ValueError(
+            f"{filename}: {len(empty)}/{len(pages)} pages have no extractable "
+            "text - scanned/image-only PDF? Needs OCR before ingestion."
+        )
     if not chunks:
         raise ValueError(
-            f"{filename}: no extractable text found - scanned/image-only PDF? "
-            "Needs OCR before ingestion."
+            f"{filename}: no extractable text found - {len(pages)} pages "
+            "produced no usable chunks after filtering."
         )
 
     embeddings = embed_texts([c.content for c in chunks])
